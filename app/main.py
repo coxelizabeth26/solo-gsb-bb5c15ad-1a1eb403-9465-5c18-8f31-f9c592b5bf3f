@@ -19,6 +19,13 @@
 
 * ``POST /canonicalize`` accepts ``{"document": ...}`` and returns the
   RFC 8785 (JCS) canonical JSON text together with its SHA-256 digest.
+
+* ``POST /validate`` accepts ``{"schema": ..., "document": ...}`` and
+  validates the document against the schema as JSON Schema Draft 2020-12.
+  Only document-local ``#`` references are allowed; remote references,
+  invalid schemas and unresolvable local references yield 422. A valid
+  schema always yields 200 with ``valid`` and (on failure) every leaf
+  error as RFC 6901 paths, sorted by instance path and keyword.
 """
 
 from __future__ import annotations
@@ -33,8 +40,9 @@ from pydantic import BaseModel, Field
 from .canonicalize import CanonicalizationError, canonicalize
 from .jsonutil import MISSING, json_equal
 from .patch import PatchConflict, PatchStructureError, apply_patch
+from .validate import SchemaValidationError, build_validator, leaf_errors
 
-app = FastAPI(title="JSON Merge, Patch & Canonicalize Service", version="1.2.0")
+app = FastAPI(title="JSON Merge, Patch, Validate & Canonicalize Service", version="1.3.0")
 
 
 def escape_pointer(token: str) -> str:
@@ -176,3 +184,26 @@ def canonicalize_endpoint(request: CanonicalizeRequest):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+class ValidateRequest(BaseModel):
+    schema_: Any = Field(..., alias="schema")
+    document: Any = Field(...)
+
+    model_config = {"populate_by_name": True}
+
+
+@app.post("/validate")
+def validate_endpoint(request: ValidateRequest):
+    try:
+        validator = build_validator(request.schema_)
+        errors = leaf_errors(validator, request.document)
+    except SchemaValidationError as exc:
+        content: dict = {"detail": "invalid schema", "reason": exc.reason}
+        if exc.ref is not None:
+            content["ref"] = exc.ref
+        content["message"] = exc.detail
+        return JSONResponse(status_code=422, content=content)
+    if errors:
+        return {"valid": False, "errors": errors}
+    return {"valid": True, "errors": []}

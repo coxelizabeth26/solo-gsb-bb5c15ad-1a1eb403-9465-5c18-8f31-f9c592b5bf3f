@@ -1,6 +1,6 @@
-# JSON Merge, Patch & Canonicalize Service
+# JSON Merge, Patch, Validate & Canonicalize Service
 
-一个基于 FastAPI 的 JSON 处理服务，提供三个接口：
+一个基于 FastAPI 的 JSON 处理服务，提供四个接口：
 
 - `POST /merge`：接收 `base`、`left`、`right` 三个 JSON 文档，将 left 和 right
   各自相对 base 的修改做三方合并；存在冲突时返回 `409` 并按 JSON Pointer 列出
@@ -8,6 +8,10 @@
 - `POST /patch`：接收 `document` 与 `operations`，按数组顺序在**深拷贝**上原子
   执行 [RFC 6902](https://www.rfc-editor.org/rfc/rfc6902) JSON Patch 的
   `add`、`remove`、`replace`、`test` 操作。
+- `POST /validate`：接收 JSON Schema `schema` 与任意 JSON `document`，按
+  [JSON Schema Draft 2020-12](https://json-schema.org/draft/2020-12/json-schema-core)
+  校验；仅允许 schema 内 `#` 本地引用，远程/无法解析的引用或无效 schema 返回
+  `422`，合法 schema 一律返回 `200` 并在失败时列出全部叶子错误。
 - `POST /canonicalize`：接收任意 JSON `document`，按
   [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785)（JCS）生成无空白、确定性的
   规范 JSON 文本，并返回其 SHA-256 摘要。
@@ -163,6 +167,90 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 `~`（先解 `~1` 再解 `~0`）。空字符串 `""` 指向整个文档。例如键 `a/b`写作
 `/a~1b`，键 `~x` 写作 `/~0x`。
 
+### `POST /validate`
+
+请求体含两个字段：
+
+| 字段       | 类型      | 说明                                        |
+| ---------- | --------- | ------------------------------------------- |
+| `schema`   | 任意 JSON | JSON Schema Draft 2020-12（对象或布尔值）   |
+| `document` | 任意 JSON | 待校验文档                                  |
+
+```json
+{
+  "schema": {
+    "$defs": { "name": { "type": "string", "minLength": 1 } },
+    "type": "object",
+    "required": ["first"],
+    "properties": {
+      "first": { "$ref": "#/$defs/name" },
+      "tags": { "items": { "type": "string" } }
+    }
+  },
+  "document": { "first": "", "tags": ["a", 3] }
+}
+```
+
+**schema 合法时一律 `200`**（无论文档是否通过），返回 `valid` 与错误列表：
+
+```json
+{
+  "valid": false,
+  "errors": [
+    {
+      "instance_path": "/first",
+      "schema_path": "/properties/first/minLength",
+      "keyword": "minLength",
+      "message": "'' should be non-empty"
+    },
+    {
+      "instance_path": "/tags/1",
+      "schema_path": "/properties/tags/items/type",
+      "keyword": "type",
+      "message": "3 is not of type 'string'"
+    }
+  ]
+}
+```
+
+通过时为 `{"valid": true, "errors": []}`。每个错误包含：
+
+| 字段            | 说明                                                              |
+| --------------- | ----------------------------------------------------------------- |
+| `instance_path` | 文档中失败位置的 RFC 6901 JSON Pointer（根为 `""`）               |
+| `schema_path`   | schema 中触发断言位置的 RFC 6901 JSON Pointer（`$ref` 解析到目标）|
+| `keyword`       | 失败关键字，如 `type`、`required`、`oneOf`（布尔 schema 时为 `""`）|
+| `message`       | 校验器给出的失败原因                                              |
+
+- 列出**全部叶子错误**：`oneOf` / `anyOf` 等聚合关键字会展开到各分支的叶子；
+  路径、关键字、消息完全相同的叶子只保留一条。
+- 稳定排序：先按 `instance_path`（数组索引按数值且排在成员名前，成员名按
+  Unicode 码点），再按 `keyword`、`schema_path`、`message`。
+- `$ref` / `$dynamicRef` **只允许文档内 `#` 引用**：`#/$defs/name`、
+  `#anchor`（配合 `$id`）均可；`https://…` 等远程 URI、`other.json#…` 等跨
+  文档相对引用一律拒绝。解析器也被配置为绝不发起任何网络请求。
+- 即使文档本身恰好“匹配”，无效 schema 仍返回 `422`；`enum`、`default`、
+  `examples` 等注解内长得像 `$ref` 的数据不会被误判。
+
+**远程引用、无法解析的本地引用或无效 schema → `422`**：
+
+```json
+{
+  "detail": "invalid schema",
+  "reason": "unresolvable reference",
+  "ref": "#/$defs/missing",
+  "message": "local reference '#/$defs/missing' cannot be resolved: ..."
+}
+```
+
+`reason` 取值：
+
+| 值                       | 场景                                                |
+| ------------------------ | --------------------------------------------------- |
+| `remote reference`       | 引用未以 `#` 开头（远程 URI / 跨文档相对引用 / 空值）|
+| `unresolvable reference` | `#` 引用的指针或锚点在 schema 内不存在，或纯自引用循环 |
+| `invalid schema`         | schema 不是对象/布尔值，或不符合 Draft 2020-12 元 schema |
+
 ### `POST /canonicalize`
 
 请求体只含一个字段，`document` 可以是**任意 JSON 值**（对象、数组、标量、甚至
@@ -254,6 +342,24 @@ curl -s -X POST http://localhost:8000/canonicalize \
 curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/canonicalize \
   -H 'Content-Type: application/json' -d '{}'
 # => 422
+
+# JSON Schema 校验：合法 schema、文档不合规 → 200 valid=false
+curl -s -X POST http://localhost:8000/validate \
+  -H 'Content-Type: application/json' \
+  -d '{"schema":{"type":"array","items":{"type":"integer"}},"document":[1,"x",3]}'
+# => {"valid":false,"errors":[{"instance_path":"/1","schema_path":"/items/type", ...}]}
+
+# 远程引用 → 422（不发起任何网络请求）
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/validate \
+  -H 'Content-Type: application/json' \
+  -d '{"schema":{"$ref":"https://example.com/s"},"document":{}}'
+# => 422
+
+# 无法解析的本地引用 → 422
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/validate \
+  -H 'Content-Type: application/json' \
+  -d '{"schema":{"$ref":"#/$defs/nope"},"document":{}}'
+# => 422
 ```
 
 ## 测试
@@ -266,12 +372,14 @@ pytest
 ## 项目结构
 
 ```
-app/main.py           # FastAPI 应用：/merge、/patch 与 /canonicalize 入口
+app/main.py           # FastAPI 应用：/merge、/patch、/validate 与 /canonicalize 入口
 app/patch.py          # RFC 6902 JSON Patch 校验与原子执行
+app/validate.py       # JSON Schema Draft 2020-12 校验、仅本地 # 引用与叶子错误收集
 app/canonicalize.py   # RFC 8785 JCS 规范化序列化（UTF-16 键序、ECMAScript 数字）
 app/jsonutil.py       # JSON 相等性与 MISSING 哨兵（接口共用）
 tests/test_merge.py        # /merge 测试
 tests/test_patch.py        # /patch 测试
+tests/test_validate.py     # /validate 测试
 tests/test_canonicalize.py # /canonicalize 测试
 requirements.txt     # 运行依赖（Docker 构建时自动安装）
 requirements-dev.txt # 测试依赖
