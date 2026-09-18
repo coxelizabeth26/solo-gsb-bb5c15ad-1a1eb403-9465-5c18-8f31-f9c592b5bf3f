@@ -1,6 +1,6 @@
-# JSON Merge, Patch & Canonicalize Service
+# JSON Merge, Patch, Canonicalize & Validate Service
 
-一个基于 FastAPI 的 JSON 处理服务，提供三个接口：
+一个基于 FastAPI 的 JSON 处理服务，提供四个接口：
 
 - `POST /merge`：接收 `base`、`left`、`right` 三个 JSON 文档，将 left 和 right
   各自相对 base 的修改做三方合并；存在冲突时返回 `409` 并按 JSON Pointer 列出
@@ -11,6 +11,9 @@
 - `POST /canonicalize`：接收任意 JSON `document`，按
   [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785)（JCS）生成无空白、确定性的
   规范 JSON 文本，并返回其 SHA-256 摘要。
+- `POST /validate`：接收 `schema` 与 `document`，按
+  [JSON Schema Draft 2020-12](https://json-schema.org/draft/2020-12/json-schema-core)
+  校验文档；失败时列出全部叶子错误（RFC 6901 路径 + 关键字 + 消息）。
 
 ## 快速开始
 
@@ -202,6 +205,72 @@ JCS 不允许的值（如超出 IEEE 754 double 范围的整数）同样返回 `
 { "detail": "document cannot be canonicalized", "reason": "..." }
 ```
 
+### `POST /validate`
+
+请求体：
+
+| 字段       | 类型      | 说明                                  |
+| ---------- | --------- | ------------------------------------- |
+| `schema`   | 任意 JSON | JSON Schema（Draft 2020-12；可为布尔） |
+| `document` | 任意 JSON | 待校验的文档（可为 `null`）           |
+
+```json
+{
+  "schema":   { "type": "object", "properties": { "a": { "type": "integer" } }, "required": ["a"] },
+  "document": { "a": "oops" }
+}
+```
+
+**Schema 合法 → 一律 `200`**（无论文档是否通过校验），响应含 `valid` 与
+`errors`（通过时为空数组）：
+
+```json
+{
+  "valid": false,
+  "errors": [
+    {
+      "instance_path": "/a",
+      "schema_path": "/properties/a/type",
+      "keyword": "type",
+      "message": "'oops' is not of type 'integer'"
+    }
+  ]
+}
+```
+
+每个错误项包含：
+
+| 字段            | 说明                                                         |
+| --------------- | ------------------------------------------------------------ |
+| `instance_path` | 出错实例位置的 JSON Pointer（RFC 6901，根为 `""`）           |
+| `schema_path`   | 失败关键字在 Schema 中的 JSON Pointer（RFC 6901）            |
+| `keyword`       | 失败的校验关键字（如 `type`、`required`、`minimum`）         |
+| `message`       | 人类可读的失败原因                                           |
+
+- 只报告**叶子错误**：`anyOf`/`oneOf` 等聚合错误的子错误会被展开，不会
+  出现只含上下文的父错误。
+- 错误按 `(instance_path, keyword)` **稳定排序**（并列时保持校验器发现
+  顺序）。
+- `instance_path` / `schema_path` 中的特殊字符按 RFC 6901 转义
+  （`~` → `~0`，`/` → `~1`），数组下标直接作为路径段。
+
+**引用规则**：仅允许文档内 `#` 开头的本地引用（`$ref` / `$dynamicRef`，
+支持 `#/...` JSON Pointer、`$anchor` / `$dynamicAnchor` 与递归引用），
+服务不会抓取任何外部资源。以下情况一律返回 **`422`**：
+
+- **远程引用**：任何不以 `#` 开头的 `$ref` / `$dynamicRef`
+  （如 `http://...`、`other.json#/x`），即使位于未被触发的分支；
+- **无效 Schema**：不是合法的 Draft 2020-12 Schema（如未知 `type`、
+  非法 `pattern` 正则、非对象/布尔的 Schema）；
+- **无法解析的本地引用**：`#/...` 指针指向不存在的位置、`#name` 没有
+  对应的 `$anchor`，或引用构成无法求值的循环。
+
+```json
+{ "detail": "remote reference not allowed", "reason": "only local '#' references are supported, got 'http://example.com/s.json'" }
+```
+
+缺少 `schema` 或 `document` 字段、请求体无法解析为 JSON 同样返回 `422`。
+
 ### `GET /health`
 
 健康检查，返回 `{"status": "ok"}`。
@@ -254,6 +323,24 @@ curl -s -X POST http://localhost:8000/canonicalize \
 curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/canonicalize \
   -H 'Content-Type: application/json' -d '{}'
 # => 422
+
+# JSON Schema 校验：通过 → valid=true
+curl -s -X POST http://localhost:8000/validate \
+  -H 'Content-Type: application/json' \
+  -d '{"schema":{"$defs":{"n":{"type":"integer","minimum":0}},"properties":{"count":{"$ref":"#/$defs/n"}}},"document":{"count":3}}'
+# => {"valid":true,"errors":[]}
+
+# 校验失败 → 200 + 叶子错误列表
+curl -s -X POST http://localhost:8000/validate \
+  -H 'Content-Type: application/json' \
+  -d '{"schema":{"properties":{"a":{"type":"integer"}},"required":["a"]},"document":{}}'
+# => {"valid":false,"errors":[{"instance_path":"","schema_path":"/required","keyword":"required","message":"'a' is a required property"}]}
+
+# 远程引用 → 422
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8000/validate \
+  -H 'Content-Type: application/json' \
+  -d '{"schema":{"$ref":"http://example.com/s.json"},"document":1}'
+# => 422
 ```
 
 ## 测试
@@ -266,13 +353,15 @@ pytest
 ## 项目结构
 
 ```
-app/main.py           # FastAPI 应用：/merge、/patch 与 /canonicalize 入口
+app/main.py           # FastAPI 应用：/merge、/patch、/canonicalize 与 /validate 入口
 app/patch.py          # RFC 6902 JSON Patch 校验与原子执行
 app/canonicalize.py   # RFC 8785 JCS 规范化序列化（UTF-16 键序、ECMAScript 数字）
+app/validate.py       # JSON Schema Draft 2020-12 校验（本地引用解析、叶子错误收集）
 app/jsonutil.py       # JSON 相等性与 MISSING 哨兵（接口共用）
 tests/test_merge.py        # /merge 测试
 tests/test_patch.py        # /patch 测试
 tests/test_canonicalize.py # /canonicalize 测试
+tests/test_validate.py     # /validate 测试
 requirements.txt     # 运行依赖（Docker 构建时自动安装）
 requirements-dev.txt # 测试依赖
 Dockerfile

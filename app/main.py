@@ -19,6 +19,14 @@
 
 * ``POST /canonicalize`` accepts ``{"document": ...}`` and returns the
   RFC 8785 (JCS) canonical JSON text together with its SHA-256 digest.
+
+* ``POST /validate`` accepts ``{"schema": ..., "document": ...}`` and
+  validates the document against the schema per JSON Schema Draft 2020-12.
+  Only local ``#`` references are supported: remote references, invalid
+  schemas and unresolvable local references yield 422. A legal schema
+  always yields 200 with a ``valid`` flag; on failure every leaf error is
+  listed with RFC 6901 ``instance_path`` / ``schema_path``, the failing
+  ``keyword`` and a message, sorted by path and keyword.
 """
 
 from __future__ import annotations
@@ -33,8 +41,14 @@ from pydantic import BaseModel, Field
 from .canonicalize import CanonicalizationError, canonicalize
 from .jsonutil import MISSING, json_equal
 from .patch import PatchConflict, PatchStructureError, apply_patch
+from .validate import (
+    InvalidSchemaError,
+    RemoteReferenceError,
+    UnresolvableReferenceError,
+    validate,
+)
 
-app = FastAPI(title="JSON Merge, Patch & Canonicalize Service", version="1.2.0")
+app = FastAPI(title="JSON Merge, Patch, Canonicalize & Validate Service", version="1.3.0")
 
 
 def escape_pointer(token: str) -> str:
@@ -171,6 +185,33 @@ def canonicalize_endpoint(request: CanonicalizeRequest):
         )
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     return {"canonical": canonical, "sha256": digest}
+
+
+class ValidateRequest(BaseModel):
+    schema_: Any = Field(..., validation_alias="schema")
+    document: Any = Field(...)
+
+
+@app.post("/validate")
+def validate_endpoint(request: ValidateRequest):
+    try:
+        errors = validate(request.schema_, request.document)
+    except InvalidSchemaError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"detail": "invalid schema", "reason": str(exc)},
+        )
+    except RemoteReferenceError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"detail": "remote reference not allowed", "reason": str(exc)},
+        )
+    except UnresolvableReferenceError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"detail": "unresolvable reference", "reason": str(exc)},
+        )
+    return {"valid": not errors, "errors": errors}
 
 
 @app.get("/health")
